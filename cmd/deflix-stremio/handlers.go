@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,11 +12,11 @@ import (
 	gocache "github.com/patrickmn/go-cache"
 	"go.uber.org/zap"
 
-	"github.com/deflix-tv/go-debrid/alldebrid"
-	"github.com/deflix-tv/go-debrid/premiumize"
-	"github.com/deflix-tv/go-debrid/realdebrid"
 	"github.com/deflix-tv/go-stremio"
-	"github.com/deflix-tv/imdb2torrent"
+	"github.com/doingodswork/deflix-stremio/pkg/debrid/alldebrid"
+	"github.com/doingodswork/deflix-stremio/pkg/debrid/premiumize"
+	"github.com/doingodswork/deflix-stremio/pkg/debrid/realdebrid"
+	"github.com/doingodswork/deflix-stremio/pkg/imdb2torrent"
 )
 
 const (
@@ -32,39 +29,53 @@ type goCacher interface {
 	Get(string) (interface{}, bool)
 }
 
-func createStreamHandler(config config, searchClient *imdb2torrent.Client, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, redirectCache goCacher, isTVShow bool, logger *zap.Logger) stremio.StreamHandler {
-	return func(ctx context.Context, id string, userDataIface interface{}) ([]stremio.StreamItem, error) {
-		var imdbID string
-		var season int
-		var episode int
-		var err error
-		if isTVShow {
-			idParts := strings.Split(id, ":")
-			if len(idParts) != 3 {
-				logger.Info("Stream handler for TV shows called without exactly 3 ID parts", zap.String("id", id))
-				return nil, stremio.BadRequest
-			}
-			imdbID = idParts[0]
-			season, err = strconv.Atoi(idParts[1])
+func createCatalogHandler(rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, logger *zap.Logger) stremio.CatalogHandler {
+	// Second parameter is the catalog ID, but we only have one per debrid service so we can ignore it.
+	return func(ctx context.Context, _ string, userDataIface interface{}) ([]stremio.MetaPreviewItem, error) {
+		// No need to check if the interface is a string or if the decoding worked, because the token middleware does that already.
+		udString := userDataIface.(string)
+		userData, _ := decodeUserData(udString, logger)
+
+		var metaPreviewItems []stremio.MetaPreviewItem
+		if userData.RDtoken != "" {
+			torrents, err := rdClient.GetTorrents(ctx, userData.RDtoken, logger)
 			if err != nil {
-				logger.Info("Couldn't convert season to int", zap.String("id", id))
-				return nil, stremio.BadRequest
+				logger.Warn("Couldn't find torrents", zap.Error(err))
+				return nil, fmt.Errorf("Couldn't find torrents: %w", err)
 			}
-			episode, err = strconv.Atoi(idParts[2])
-			if err != nil {
-				logger.Info("Couldn't convert episode to int", zap.String("id", id))
-				return nil, stremio.BadRequest
+			metaPreviewItems = make([]stremio.MetaPreviewItem, len(torrents))
+			fmt.Printf("================ torrents: %+v\n", torrents)
+			for i, torrent := range torrents {
+				metaPreviewItems[i] = stremio.MetaPreviewItem{
+					ID:   "deflix-" + torrent.ID,
+					Type: "unknown",
+					Name: torrent.Filename,
+
+					ReleaseInfo: torrent.Added,
+				}
 			}
+		} else if userData.ADkey != "" {
+			// TODO: use ad client to fetch downloads
 		} else {
-			imdbID = id
+			// TODO: use pm client to fetch downloads
 		}
 
-		var torrents []imdb2torrent.Result
-		if isTVShow {
-			torrents, err = searchClient.FindTVShow(ctx, imdbID, season, episode)
-		} else {
-			torrents, err = searchClient.FindMovie(ctx, imdbID)
-		}
+		return metaPreviewItems, nil
+	}
+}
+
+func createCatalogStreamHandler(config config, searchClient *imdb2torrent.Client, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, redirectCache goCacher, logger *zap.Logger) stremio.StreamHandler {
+	// IDs have the prefix "deflix-". This is guaranteed because the meta items we return in the catalog have type "unknown" and this stream handler is registered for that type.
+	return func(ctx context.Context, id string, userDataIface interface{}) ([]stremio.StreamItem, error) {
+		fmt.Printf("================= id: %v\n", id)
+		// TODO: implement
+		return nil, nil
+	}
+}
+
+func createStreamHandler(config config, searchClient *imdb2torrent.Client, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, redirectCache goCacher, logger *zap.Logger) stremio.StreamHandler {
+	return func(ctx context.Context, id string, userDataIface interface{}) ([]stremio.StreamItem, error) {
+		torrents, err := searchClient.FindMagnets(ctx, id)
 		if err != nil {
 			logger.Warn("Couldn't find magnets", zap.Error(err))
 			return nil, fmt.Errorf("Couldn't find magnets: %w", err)
@@ -83,17 +94,13 @@ func createStreamHandler(config config, searchClient *imdb2torrent.Client, rdCli
 		for _, torrent := range torrents {
 			infoHashes = append(infoHashes, torrent.InfoHash)
 		}
-		var debridID string
 		var availableInfoHashes []string
-		keyOrToken := ctx.Value("deflix_keyOrToken").(string)
-		if userData.RDtoken != "" || userData.RDoauth2 != "" {
-			debridID = "rd"
-			availableInfoHashes = rdClient.CheckInstantAvailability(ctx, keyOrToken, infoHashes...)
+		if userData.RDtoken != "" {
+			availableInfoHashes = rdClient.CheckInstantAvailability(ctx, userData.RDtoken, infoHashes...)
 		} else if userData.ADkey != "" {
-			debridID = "ad"
-			availableInfoHashes = adClient.CheckInstantAvailability(ctx, keyOrToken, infoHashes...)
+			availableInfoHashes = adClient.CheckInstantAvailability(ctx, userData.ADkey, infoHashes...)
 		} else {
-			debridID = "pm"
+			keyOrToken := ctx.Value("deflix_keyOrToken").(string)
 			availableInfoHashes = pmClient.CheckInstantAvailability(ctx, keyOrToken, infoHashes...)
 		}
 		if len(availableInfoHashes) == 0 {
@@ -116,7 +123,7 @@ func createStreamHandler(config config, searchClient *imdb2torrent.Client, rdCli
 
 		// Note: The torrents slice is guaranteed to not be empty at this point, because it already contained non-duplicate info hashes and then only unavailable ones were filtered and then a `len(availableInfoHashes) == 0` was done.
 
-		// Separate all torrent results into a 720p, 1080p, 1080p 10bit, 2160p and 2160p 10bit list, so we can offer the user one stream for each quality now (or maybe just for one quality if there's no torrent for the other), cache the torrents for each apiToken-ID-quality combination and later (at the redirect endpoint) go through the respective torrent list to turn it into a streamable video URL via RealDebrid.
+		// Separate all torrent results into a 720p, 1080p, 1080p 10bit, 2160p and 2160p 10bit list, so we can offer the user one stream for each quality now (or maybe just for one quality if there's no torrent for the other), cache the torrents for each apiToken-imdbID-quality combination and later (at the redirect endpoint) go through the respective torrent list to turn it into a streamable video URL via RealDebrid.
 		var torrents720p []imdb2torrent.Result
 		var torrents1080p []imdb2torrent.Result
 		var torrents1080p10bit []imdb2torrent.Result
@@ -138,37 +145,37 @@ func createStreamHandler(config config, searchClient *imdb2torrent.Client, rdCli
 			}
 		}
 
-		// Cache results to make this data available in the redirect handler. It will pick the first torrent from the list and convert it via RD / AD / PM, or pick the next if the previous didn't work.
-		// There's no need to cache this for a specific user, but it MUST be cached per debrid service - otherwise during concurrent requests, when a RD user goes to the redirect endpoint it could fetch torrents from the cache which are only available on AD / PM leading to a worse experience for the RD user.
+		// Cache results to make this data available in the redirect handler. It will pick the first torrent from the list and convert it via RD, or pick the next if the previous didn't work.
+		// There's no need to cache this for a specific user.
 		// This cache *must* be a cache where items aren't evicted when the cache is full, because otherwise if the cache is full and two users fetch available streams, then the second one could lead to the first cache item being evicted before the first user clicks on the stream, leading to an error inside the redirect handler after he clicks on the stream.
-		redirectCache.Set(id+"-"+debridID+"-720p", torrents720p, redirectExpiration)
-		redirectCache.Set(id+"-"+debridID+"-1080p", torrents1080p, redirectExpiration)
-		redirectCache.Set(id+"-"+debridID+"-1080p.10bit", torrents1080p10bit, redirectExpiration)
-		redirectCache.Set(id+"-"+debridID+"-2160p", torrents2160p, redirectExpiration)
-		redirectCache.Set(id+"-"+debridID+"-2160p.10bit", torrents2160p10bit, redirectExpiration)
+		redirectCache.Set(id+"-720p", torrents720p, redirectExpiration)
+		redirectCache.Set(id+"-1080p", torrents1080p, redirectExpiration)
+		redirectCache.Set(id+"-1080p.10bit", torrents1080p10bit, redirectExpiration)
+		redirectCache.Set(id+"-2160p", torrents2160p, redirectExpiration)
+		redirectCache.Set(id+"-2160p.10bit", torrents2160p10bit, redirectExpiration)
 
 		// We already respond with several URLs (one for each quality, as long as we have torrents for the different qualities), but they point to our server for now.
 		// Only when the user clicks on a stream and arrives at our redirect endpoint, we go through the list of torrents for the selected quality and try to convert them into a streamable video URL via RealDebrid.
 		// There it should usually work for the first torrent we try, because we already checked the "instant availability" on RealDebrid here. If the "instant availability" info is stale (because we cached it), the next torrent will be used.
 		var streams []stremio.StreamItem
 		if len(torrents720p) > 0 {
-			stream := createStreamItem(ctx, config, udString, id+"-"+debridID+"-720p", "720p", torrents720p)
+			stream := createStreamItem(ctx, config, udString, id+"-720p", "720p", torrents720p)
 			streams = append(streams, stream)
 		}
 		if len(torrents1080p) > 0 {
-			stream := createStreamItem(ctx, config, udString, id+"-"+debridID+"-1080p", "1080p", torrents1080p)
+			stream := createStreamItem(ctx, config, udString, id+"-1080p", "1080p", torrents1080p)
 			streams = append(streams, stream)
 		}
 		if len(torrents1080p10bit) > 0 {
-			stream := createStreamItem(ctx, config, udString, id+"-"+debridID+"-1080p.10bit", "1080p 10bit", torrents1080p10bit)
+			stream := createStreamItem(ctx, config, udString, id+"-1080p.10bit", "1080p 10bit", torrents1080p10bit)
 			streams = append(streams, stream)
 		}
 		if len(torrents2160p) > 0 {
-			stream := createStreamItem(ctx, config, udString, id+"-"+debridID+"-2160p", "2160p", torrents2160p)
+			stream := createStreamItem(ctx, config, udString, id+"-2160p", "2160p", torrents2160p)
 			streams = append(streams, stream)
 		}
 		if len(torrents2160p10bit) > 0 {
-			stream := createStreamItem(ctx, config, udString, id+"-"+debridID+"-2160p.10bit", "2160p 10bit", torrents2160p10bit)
+			stream := createStreamItem(ctx, config, udString, id+"-2160p.10bit", "2160p 10bit", torrents2160p10bit)
 			streams = append(streams, stream)
 		}
 
@@ -177,10 +184,8 @@ func createStreamHandler(config config, searchClient *imdb2torrent.Client, rdCli
 }
 
 func createStreamItem(ctx context.Context, config config, encodedUserData string, redirectID, quality string, torrents []imdb2torrent.Result) stremio.StreamItem {
-	// Path escaping required for TV shows, which contain ":"
-	redirectID = url.PathEscape(redirectID)
 	stream := stremio.StreamItem{
-		URL: config.BaseURL + "/" + encodedUserData + "/redirect/" + redirectID,
+		URL: config.StreamURLaddr + "/" + encodedUserData + "/redirect/" + redirectID,
 		// Stremio docs recommend to use the stream quality as title.
 		// See https://github.com/Stremio/stremio-addon-sdk/blob/ddaa3b80def8a44e553349734dd02ec9c3fea52c/docs/api/responses/stream.md#additional-properties-to-provide-information--behaviour-flags
 		Title: quality,
@@ -202,16 +207,23 @@ func createStreamItem(ctx context.Context, config config, encodedUserData string
 	return stream
 }
 
-func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, forwardOriginIP bool, logger *zap.Logger) fiber.Handler {
+func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, logger *zap.Logger) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		logger.Debug("redirectHandler called", zap.String("request", fmt.Sprintf("%+v", c.Request())))
 
-		udString := c.Params("userData")
 		redirectID := c.Params("id", "")
 		if redirectID == "" {
 			return c.SendStatus(fiber.StatusNotFound)
 		}
 		zapFieldRedirectID := zap.String("redirectID", redirectID)
+
+		idParts := strings.Split(redirectID, "-")
+		// "<imdbID>-<quality>", where quality might contain a ".10bit" suffix
+		if len(idParts) != 2 {
+			return c.SendStatus(fiber.StatusBadRequest)
+		}
+		imdbID := idParts[0]
+		quality := idParts[1]
 
 		// Before we look into the cache, we need to set a lock so that concurrent calls to this endpoint (including the redirectID) don't unnecessarily lead to the full sharade of RD requests again, only because the first handling of the request wasn't fast enough to fill the cache.
 		// The lock objects are created in the stream handler. But if the service was restarted the map is empty. So we need to create lock objects in that case for the users arriving at the redirect handler without having been at the stream handler after a service restart.
@@ -224,15 +236,11 @@ func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realde
 		defer redirectLock[redirectID].Unlock()
 
 		// Check stream cache first.
-		// Here we don't get the data that's passed from the stream handler to this redirect handler, but instead the the RD / AD / PM HTTP stream URL, which is cached after it was converted in a previous call.
+		// Here we don't get the data that's passed from the stream handler to this redirect handler, but instead the the RealDebrid HTTP stream URL, which is cached after it was converted in a previous call.
 		// This cache is important, because for a single click on a stream in Stremio there are multiple requests to this endpoint in a short timeframe.
 		// This cache is also useful for when a user resumes his stream via Stremio after closing it. In this case the same RealDebrid HTTP stream must be delivered (or even if it would work with another one, using the same one would be beneficial).
-		// Because the actual stream URLs are cached here, it MUST be user-specific! No need to use the full userData string though - we just hash it and use that as "user identifier".
-		// TODO: Regarding stream resuming: We don't know how long RD / AD / PM HTTP stream URLs are valid. If it's shorter, we can shorten this as well. Also see similar TODO comment in main.go file.
-		userHash := sha256.Sum256([]byte(udString))
-		userHashEncoded := base64.RawURLEncoding.EncodeToString(userHash[:])
-		streamCacheID := userHashEncoded + "-" + redirectID
-		if streamURLiface, found := streamCache.Get(streamCacheID); found {
+		// TODO: We don't know how long RealDebrid HTTP stream URLs are valid though! If it's shorter, we can shorten this as well. Also see similar TODO comment in main.go file.
+		if streamURLiface, found := streamCache.Get(redirectID); found {
 			logger.Debug("Hit stream cache", zapFieldRedirectID)
 			if streamURLitem, ok := streamURLiface.(cacheItem); !ok {
 				logger.Error("Stream cache item couldn't be cast into cacheItem", zap.String("cacheItemType", fmt.Sprintf("%T", streamURLiface)), zapFieldRedirectID)
@@ -249,9 +257,9 @@ func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realde
 		}
 
 		// Here we get the data from the cache that the stream handler filled.
-		torrentsIface, found := redirectCache.Get(redirectID)
+		torrentsIface, found := redirectCache.Get(imdbID + "-" + quality)
 		if !found {
-			logger.Warn("No torrents cache item found, did 24h pass?", zapFieldRedirectID)
+			logger.Warn(fmt.Sprintf("No torrents cache item found for %v, did 24h pass?", imdbID+"-"+quality), zapFieldRedirectID)
 			// TODO: Just run the same stuff the stream handler does! This way we can drastically reduce the required cache time for the redirect cache, and the scraping doesn't really take long! Take care of concurrent requests - maybe lock!
 			return c.SendStatus(fiber.StatusNotFound)
 		}
@@ -262,19 +270,17 @@ func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realde
 		}
 		// Parse userData.
 		// No need to check if decoding worked, because the token middleware does that already.
+		udString := c.Params("userData")
 		userData, _ := decodeUserData(udString, logger)
 		var streamURL string
 		var err error
-		keyOrToken := c.Locals("deflix_keyOrToken").(string)
-		if forwardOriginIP && len(c.IPs()) > 0 {
-			c.Locals("debrid_originIP", c.IPs()[0])
-		}
 		for _, torrent := range torrents {
-			if userData.RDtoken != "" || userData.RDoauth2 != "" {
-				streamURL, err = rdClient.GetStreamURL(c.Context(), torrent.MagnetURL, keyOrToken, userData.RDremote)
+			if userData.RDtoken != "" {
+				streamURL, err = rdClient.GetStreamURL(c.Context(), torrent.MagnetURL, userData.RDtoken, userData.RDremote)
 			} else if userData.ADkey != "" {
-				streamURL, err = adClient.GetStreamURL(c.Context(), torrent.MagnetURL, keyOrToken)
+				streamURL, err = adClient.GetStreamURL(c.Context(), torrent.MagnetURL, userData.ADkey)
 			} else {
+				keyOrToken := c.Locals("deflix_keyOrToken").(string)
 				streamURL, err = pmClient.GetStreamURL(c.Context(), torrent.MagnetURL, keyOrToken)
 			}
 			if err != nil {
@@ -289,7 +295,7 @@ func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realde
 			Value:   streamURL,
 			Created: time.Now(),
 		}
-		streamCache.Set(streamCacheID, streamURLitem, streamExpiration)
+		streamCache.Set(redirectID, streamURLitem, streamExpiration)
 
 		if streamURL == "" {
 			return c.SendStatus(fiber.StatusNotFound)
@@ -301,7 +307,7 @@ func createRedirectHandler(redirectCache, streamCache goCacher, rdClient *realde
 	}
 }
 
-func createStatusHandler(magnetSearchers map[string]imdb2torrent.MagnetSearcher, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, goCaches map[string]*gocache.Cache, forwardOriginIP bool, logger *zap.Logger) fiber.Handler {
+func createStatusHandler(magnetSearchers map[string]imdb2torrent.MagnetSearcher, rdClient *realdebrid.Client, adClient *alldebrid.Client, pmClient *premiumize.Client, goCaches map[string]*gocache.Cache, logger *zap.Logger) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		logger.Debug("statusHandler called", zap.String("request", fmt.Sprintf("%+v", c.Request())))
 
@@ -332,7 +338,7 @@ func createStatusHandler(magnetSearchers map[string]imdb2torrent.MagnetSearcher,
 					return
 				}
 				startSearch := time.Now()
-				results, err := goClient.FindMovie(c.Context(), imdbID)
+				results, err := goClient.Find(c.Context(), imdbID)
 				lock.Lock()
 				defer lock.Unlock()
 				res += "\t\t" + `"` + goName + `": {` + "\n"
@@ -355,12 +361,6 @@ func createStatusHandler(magnetSearchers map[string]imdb2torrent.MagnetSearcher,
 		wg.Wait()
 		res = strings.TrimRight(res, ",\n") + "\n"
 		res += "\t" + `},` + "\n"
-
-		// Check debrid clients
-
-		if forwardOriginIP && len(c.IPs()) > 0 {
-			c.Locals("debrid_originIP", c.IPs()[0])
-		}
 
 		// Check RD client
 

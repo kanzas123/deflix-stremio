@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
@@ -16,56 +16,86 @@ import (
 
 	"github.com/dgraph-io/badger/v2"
 	"github.com/go-redis/redis/v8"
+	"github.com/gofiber/fiber/v2"
 	"github.com/markbates/pkger"
 	gocache "github.com/patrickmn/go-cache"
 	"github.com/spf13/afero"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
 
-	"github.com/deflix-tv/go-debrid/alldebrid"
-	"github.com/deflix-tv/go-debrid/premiumize"
-	"github.com/deflix-tv/go-debrid/realdebrid"
 	"github.com/deflix-tv/go-stremio"
 	"github.com/deflix-tv/go-stremio/pkg/cinemeta"
-	"github.com/deflix-tv/imdb2torrent"
+	"github.com/doingodswork/deflix-stremio/pkg/debrid/alldebrid"
+	"github.com/doingodswork/deflix-stremio/pkg/debrid/premiumize"
+	"github.com/doingodswork/deflix-stremio/pkg/debrid/realdebrid"
+	"github.com/doingodswork/deflix-stremio/pkg/imdb2torrent"
 	"github.com/doingodswork/deflix-stremio/pkg/logadapter"
 	"github.com/doingodswork/deflix-stremio/pkg/metafetcher"
 )
 
 const (
-	version = "0.11.1"
+	version = "0.10.2"
 )
 
-var manifest = stremio.Manifest{
-	ID:          "tv.deflix.stremio",
-	Name:        "Deflix - Debrid flicks",
-	Description: "Finds movies and TV shows on YTS, The Pirate Bay, 1337x, RARBG and ibit and automatically turns them into cached HTTP streams with a debrid service like RealDebrid, AllDebrid or Premiumize, for high speed 4k streaming and no P2P uploading (!). For more info see https://www.deflix.tv",
-	Version:     version,
+var (
+	manifest = stremio.Manifest{
+		ID:          "tv.deflix.stremio",
+		Name:        "Deflix - Debrid flicks",
+		Description: "Finds movies on YTS, The Pirate Bay, 1337x, RARBG and ibit and automatically turns them into cached HTTP streams with a debrid service like RealDebrid, AllDebrid or Premiumize, for high speed 4k streaming and no P2P uploading (!). For more info see https://www.deflix.tv",
+		Version:     version,
 
-	ResourceItems: []stremio.ResourceItem{
-		{
-			Name:  "stream",
-			Types: []string{"movie", "series"},
-			// Shouldn't be required as long as they're defined globally in the manifest, but some Stremio clients send stream requests for non-IMDb IDs, so maybe setting this here as well helps
-			IDprefixes: []string{"tt"},
+		ResourceItems: []stremio.ResourceItem{
+			{
+				Name:  "stream",
+				Types: []string{"movie", "unknown"},
+				// Shouldn't be required as long as they're defined globally in the manifest, but some Stremio clients send stream requests for non-IMDb IDs, so maybe setting this here as well helps.
+				// The "deflix-" prefix is for debrid service catalog items.
+				IDprefixes: []string{"tt", "deflix-"},
+			},
+			{
+				Name: "catalog",
+				// All Stremio-supported types that a user could've downloaded to RD/AD/Premiumize. This excludes "channel" (like YouTube channels, so a list of videos) and "tv" (which is live). Custom names are allowed.
+				Types: []string{"unknown"},
+			},
 		},
-	},
-	Types: []string{"movie", "series"},
-	// An empty slice is required for serializing to a JSON that Stremio expects
-	Catalogs: []stremio.CatalogItem{},
+		Types: []string{"movie", "unknown"},
+		// An empty slice is required for serializing to a JSON that Stremio expects.
+		// We're altering the manifest and add a catalog (of videos downloaded to RD/AD/Premiumize) if a user configured the addon that way.
+		Catalogs: []stremio.CatalogItem{},
 
-	IDprefixes: []string{"tt"},
-	// Must use www.deflix.tv instead of just deflix.tv because GitHub takes care of redirecting non-www to www and this leads to HTTPS certificate issues.
-	Background: "https://www.deflix.tv/images/Logo-1024px.png",
-	Logo:       "https://www.deflix.tv/images/Logo-250px.png",
+		// The "deflix-" prefix is for debrid service catalog items.
+		IDprefixes: []string{"tt", "deflix-"},
+		// Must use www.deflix.tv instead of just deflix.tv because GitHub takes care of redirecting non-www to www and this leads to HTTPS certificate issues.
+		Background: "https://www.deflix.tv/images/Logo-1024px.png",
+		Logo:       "https://www.deflix.tv/images/Logo-250px.png",
 
-	BehaviorHints: stremio.BehaviorHints{
-		P2P:                   false,
-		Configurable:          true,
-		ConfigurationRequired: true,
-	},
-}
+		BehaviorHints: stremio.BehaviorHints{
+			P2P:                   false,
+			Configurable:          true,
+			ConfigurationRequired: true,
+		},
+	}
+
+	catalogs = []stremio.CatalogItem{
+		{
+			Type: "unknown",
+			ID:   "rd-torrents",
+			Name: "Torrents you added to RealDebrid",
+		},
+		{
+			Type: "unknown",
+			ID:   "ad-torrents",
+			Name: "Torrents you added to AllDebrid",
+		},
+		{
+			Type: "unknown",
+			ID:   "pm-torrents",
+			Name: "Torrents you added to Premiumize",
+		},
+	}
+)
 
 var (
 	// Timeout used for HTTP requests in the cinemeta, imdb2torrent and realdebrid clients.
@@ -104,7 +134,7 @@ var (
 
 // Clients
 var (
-	metaFetcher  *metafetcher.Client
+	metaFetcher  stremio.MetaFetcher
 	searchClient *imdb2torrent.Client
 	rdClient     *realdebrid.Client
 	adClient     *alldebrid.Client
@@ -133,7 +163,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create an "info" logger at first, replace later in case the logging level is configured to be something else
-	logger, err := stremio.NewLogger("info", stremio.DefaultOptions.LogEncoding)
+	logger, err := stremio.NewLogger("info")
 	if err != nil {
 		panic(err)
 	}
@@ -146,9 +176,9 @@ func main() {
 	if err != nil {
 		logger.Fatal("Couldn't marshal config to JSON", zap.Error(err))
 	}
-	if config.LogLevel != "info" || config.LogEncoding != stremio.DefaultOptions.LogEncoding {
+	if config.LogLevel != "info" {
 		// Replace previously created logger
-		if logger, err = stremio.NewLogger(config.LogLevel, config.LogEncoding); err != nil {
+		if logger, err = stremio.NewLogger(config.LogLevel); err != nil {
 			logger.Fatal("Couldn't create new logger", zap.Error(err))
 		}
 	}
@@ -199,9 +229,11 @@ func main() {
 
 	// Prepare addon creation
 
-	movieStreamHandler := createStreamHandler(config, searchClient, rdClient, adClient, pmClient, redirectCache, false, logger)
-	tvShowStreamHandler := createStreamHandler(config, searchClient, rdClient, adClient, pmClient, redirectCache, true, logger)
-	streamHandlers := map[string]stremio.StreamHandler{"movie": movieStreamHandler, "series": tvShowStreamHandler}
+	catalogHandler := createCatalogHandler(rdClient, adClient, pmClient, logger)
+	streamHandler := createStreamHandler(config, searchClient, rdClient, adClient, pmClient, redirectCache, logger)
+	catalogStreamHandler := createCatalogStreamHandler(config, searchClient, rdClient, adClient, pmClient, redirectCache, logger)
+	catalogHandlers := map[string]stremio.CatalogHandler{"unknown": catalogHandler}
+	streamHandlers := map[string]stremio.StreamHandler{"movie": streamHandler, "unknown": catalogStreamHandler}
 
 	var httpFS http.FileSystem
 	if config.WebConfigurePath == "" {
@@ -274,71 +306,79 @@ func main() {
 		// We already have a metaFetcher Client
 		MetaClient:      metaFetcher,
 		ConfigureHTMLfs: httpFS,
-		// Regular IMDb IDs or for TV shows (IMDbID:season:episode)
-		StreamIDregex: `^tt\d{7,8}(:\d+:\d+)?$`,
+		// IMDb IDs for regular streams and "deflix-" for debrid service catalog items
+		StreamIDregex: "(tt\\d{7,8}|deflix-.+)",
 	}
 
 	// Create addon
 
-	addon, err := stremio.NewAddon(manifest, nil, streamHandlers, options)
+	addon, err := stremio.NewAddon(manifest, catalogHandlers, streamHandlers, options)
 	if err != nil {
 		logger.Fatal("Couldn't create new addon", zap.Error(err))
 	}
 
 	// Customize addon
 
-	var confRD oauth2.Config
-	var confPM oauth2.Config
-	var aesKey []byte
-	if config.UseOAUTH2 {
-		confRD = oauth2.Config{
-			ClientID:     config.OAUTH2clientIDrd,
-			ClientSecret: config.OAUTH2clientSecretRD,
-			RedirectURL:  config.BaseURL + "/oauth2/install/rd",
-			Endpoint: oauth2.Endpoint{
-				AuthURL:  config.OAUTH2authorizeURLrd,
-				TokenURL: config.OAUTH2tokenURLrd,
-			},
-		}
-		confPM = oauth2.Config{
-			ClientID:     config.OAUTH2clientIDpm,
-			ClientSecret: config.OAUTH2clientSecretPM,
-			RedirectURL:  config.BaseURL + "/oauth2/install/pm",
-			Endpoint: oauth2.Endpoint{
-				AuthURL:  config.OAUTH2authorizeURLpm,
-				TokenURL: config.OAUTH2tokenURLpm,
-			},
-		}
-		// We need 32 bytes for AES-256, but the provided password might not be 32 bytes long.
-		// => Simply hash the password.
-		// Hashing it doesn't reduce the security. Also: Using a slow hash (like bcrypt) doesn't help much,
-		// because we don't store the hash anywhere where an attacker could start calculating hashes of values in dictionaries to find a match.
-		hash := sha256.Sum256([]byte(config.OAUTH2encryptionKey))
-		// SHA-256 result is 32 bytes, exactly as many as we need.
-		aesKey = hash[:]
+	confPM := oauth2.Config{
+		ClientID:     config.OAUTH2clientIDpm,
+		ClientSecret: config.OAUTH2clientSecretPM,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  config.OAUTH2authorizeURLpm,
+			TokenURL: config.OAUTH2tokenURLpm,
+		},
 	}
-	authMiddleware := createAuthMiddleware(rdClient, adClient, pmClient, config.UseOAUTH2, confRD, confPM, aesKey, logger)
+
+	logger.Info("Starting to hash the OAuth2 encryption key...")
+	hashStart := time.Now()
+	// Default bcrypt "cost" is 10, but we're only hashing this one time at startup, so we can spend a second or so.
+	bcryptKey, err := bcrypt.GenerateFromPassword([]byte(config.OAUTH2encryptionKey), 14)
+	if err != nil {
+		logger.Fatal("Couldn't hash OAuth2 encryption key via bcrypt", zap.Error(err))
+	}
+	logger.Info("Finished hashing the OAuth2 encryption key.", zap.Duration("duration", time.Since(hashStart)))
+	// The bcrypt result is 60 bytes. We want 32 bytes for AES-256. The initial bytes in bcrypt are the same, so we use the last ones.
+	aesKey := bcryptKey[28:60]
+	authMiddleware := createAuthMiddleware(rdClient, adClient, pmClient, config.UseOAUTH2, confPM, aesKey, logger)
 	addon.AddMiddleware("/:userData/manifest.json", authMiddleware)
 	addon.AddMiddleware("/:userData/stream/:type/:id.json", authMiddleware)
 	addon.AddMiddleware("/:userData/redirect/:id", authMiddleware)
 	// No need to set the middleware to the stream route without user data because go-stremio blocks it (with a 400 Bad Request response) if BehaviorHints.ConfigurationRequired is true.
 
+	manifestCallback := func(ctx context.Context, m *stremio.Manifest, userDataIface interface{}) int {
+		// The middleware already took care of validating the user data
+		udString := userDataIface.(string)
+		userData, _ := decodeUserData(udString, logger)
+		// If the user wants RD/AD/Premiumize downloads as catalog, we add the catalog to the manifest
+		if userData.Catalog {
+			if userData.RDtoken != "" {
+				fmt.Printf("============= adding catalog to manifest")
+				m.Catalogs = append(m.Catalogs, catalogs[0])
+			} else if userData.ADkey != "" {
+				m.Catalogs = append(m.Catalogs, catalogs[1])
+			} else {
+				m.Catalogs = append(m.Catalogs, catalogs[2])
+			}
+		}
+		return fiber.StatusOK
+	}
+	addon.SetManifestCallback(manifestCallback)
+
 	// Requires URL query: "?imdbid=123&apitoken=foo"
-	statusEndpoint := createStatusHandler(searchClient.GetMagnetSearchers(), rdClient, adClient, pmClient, goCaches, config.ForwardOriginIP, logger)
+	statusEndpoint := createStatusHandler(searchClient.GetMagnetSearchers(), rdClient, adClient, pmClient, goCaches, logger)
 	addon.AddEndpoint("GET", "/status", statusEndpoint)
 
 	// Redirects stream URLs (previously sent to Stremio) to the actual RealDebrid stream URLs
-	redirHandler := createRedirectHandler(redirectCache, streamCache, rdClient, adClient, pmClient, config.ForwardOriginIP, logger)
+	redirHandler := createRedirectHandler(redirectCache, streamCache, rdClient, adClient, pmClient, logger)
 	addon.AddEndpoint("GET", "/:userData/redirect/:id", redirHandler)
 	// Stremio sends a HEAD request before starting a stream.
 	addon.AddEndpoint("HEAD", "/:userData/redirect/:id", redirHandler)
 
-	// For OAuth2 redirect handling for RealDebrid and Premiumize
-	isHTTPS := strings.HasPrefix(config.BaseURL, "https")
-	oauth2initHandler := createOAUTH2initHandler(confRD, confPM, isHTTPS, logger)
-	addon.AddEndpoint("GET", "/oauth2/init/:service", oauth2initHandler)
-	oauth2installHandler := createOAUTH2installHandler(confRD, confPM, aesKey, logger)
-	addon.AddEndpoint("GET", "/oauth2/install/:service", oauth2installHandler)
+	// For OAuth2 redirect handling for Premiumize
+	isHTTPS := strings.HasPrefix(config.StreamURLaddr, "https")
+	oauth2initHandler := createOAUTH2initHandler(confPM, isHTTPS, logger)
+	addon.AddEndpoint("GET", "/oauth2/init", oauth2initHandler)
+	oauth2installHandler := createOAUTH2installHandler(confPM, aesKey, logger)
+	addon.AddEndpoint("GET", "/oauth2/install", oauth2installHandler)
 
 	// Save cache to file every hour
 	go func() {
@@ -528,7 +568,8 @@ func initClients(config config, logger *zap.Logger) {
 	cinemetaClient := cinemeta.NewClient(cinemeta.DefaultClientOpts, cinemetaCache, logger)
 	metaFetcher, err = metafetcher.NewClient(config.IMDB2metaAddr, cinemetaClient, logger)
 	if err != nil {
-		logger.Fatal("Couldn't create metafetcher client", zap.Error(err))
+		logger.Error("Couldn't create metafetcher client, continuing with regular cinemetaClient", zap.Error(err))
+		metaFetcher = cinemetaClient
 	}
 
 	ytsClientOpts := imdb2torrent.NewYTSclientOpts(config.BaseURLyts, timeout, config.MaxAgeTorrents)
@@ -536,9 +577,9 @@ func initClients(config config, logger *zap.Logger) {
 	leetxClientOpts := imdb2torrent.NewLeetxClientOpts(config.BaseURL1337x, timeout, config.MaxAgeTorrents)
 	ibitClientOpts := imdb2torrent.NewIbitClientOpts(config.BaseURLibit, timeout, config.MaxAgeTorrents)
 	rarbgClientOpts := imdb2torrent.NewRARBGclientOpts(config.BaseURLrarbg, timeout, config.MaxAgeTorrents)
-	rdClientOpts := realdebrid.NewClientOpts(config.BaseURLrd, timeout, config.CacheAgeXD, config.ExtraHeadersXD, config.ForwardOriginIP)
+	rdClientOpts := realdebrid.NewClientOpts(config.BaseURLrd, timeout, config.CacheAgeXD, config.ExtraHeadersXD)
 	adClientOpts := alldebrid.NewClientOpts(config.BaseURLad, timeout, config.CacheAgeXD, config.ExtraHeadersXD)
-	pmClientOpts := premiumize.NewClientOpts(config.BaseURLpm, timeout, config.CacheAgeXD, config.ExtraHeadersXD, config.ForwardOriginIP)
+	pmClientOpts := premiumize.NewClientOpts(config.BaseURLpm, timeout, config.CacheAgeXD, config.ExtraHeadersXD, config.UseOAUTH2)
 
 	tpbClient, err := imdb2torrent.NewTPBclient(tpbClientOpts, torrentCache, metaFetcher, logger, config.LogFoundTorrents)
 	if err != nil {
